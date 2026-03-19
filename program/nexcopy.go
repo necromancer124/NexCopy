@@ -193,9 +193,9 @@ func (m model) copyCmd() {
 // ---------- MAIN ----------
 
 func main() {
-	user := "dovshmi"
-	host := "192.168.1.147"
-	remotePath := "/home/dovshmi/Downloads"
+	user := ""       //PUT YOUR USERNAME HERE
+	host := ""       //PUT YOUR IP HERE
+	remotePath := "" //PUT YOUR REMOTE PATH HERE
 
 	modeDown := flag.Bool("down", false, "Download from remote")
 	modeUp := flag.Bool("up", false, "Upload to remote")

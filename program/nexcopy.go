@@ -11,7 +11,19 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
+	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/spinner"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/huh"
+	"github.com/charmbracelet/lipgloss"
+)
+
+// ---------- STYLING ----------
+
+var (
+	statusStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5F87")).Bold(true)
+	doneStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#00FF00")).Bold(true)
+	infoStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#3C3C3C")).Italic(true)
 )
 
 // ---------- ITEM & SSH LIST ----------
@@ -51,7 +63,7 @@ func listRemote(user, host, path string) ([]list.Item, error) {
 	return items, nil
 }
 
-// ---------- WINDOWS DIALOG HELPERS (WITH DEFAULT PATHS) ----------
+// ---------- WINDOWS DIALOG HELPERS ----------
 
 func getDownloadsPath() string {
 	home, _ := os.UserHomeDir()
@@ -74,7 +86,6 @@ func openFolderDialog(title string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
 	return strings.TrimSpace(string(out)), nil
 }
 
@@ -94,7 +105,6 @@ func openFileDialog(title string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	raw := strings.TrimSpace(string(out))
 	if raw == "" {
 		return nil, nil
@@ -102,20 +112,113 @@ func openFileDialog(title string) ([]string, error) {
 	return strings.Split(raw, "\r\n"), nil
 }
 
-// ---------- DOWNLOAD TUI MODEL ----------
+// ---------- TRANSFER PROGRESS UI ----------
+
+type transferMsg struct {
+	index int
+	err   error
+}
+
+type transferModel struct {
+	user, host, remotePath, localDest string
+	paths                             []string
+	isDownload                        bool
+	index                             int
+	err                               error
+	quitting                          bool
+
+	spinner  spinner.Model
+	progress progress.Model
+}
+
+func (m transferModel) Init() tea.Cmd {
+	return tea.Batch(m.spinner.Tick, m.runTransfer(0))
+}
+
+func (m transferModel) runTransfer(idx int) tea.Cmd {
+	return func() tea.Msg {
+		var cmd *exec.Cmd
+		local := m.paths[idx]
+		remoteFile := filepath.Base(local)
+
+		if m.isDownload {
+			fullRemote := fmt.Sprintf("%s@%s:%s/%s", m.user, m.host, m.remotePath, remoteFile)
+			cmd = exec.Command("scp", "-r", fullRemote, m.localDest)
+		} else {
+			fullRemote := fmt.Sprintf("%s@%s:%s", m.user, m.host, m.remotePath)
+			cmd = exec.Command("scp", "-r", local, fullRemote)
+		}
+
+		err := cmd.Run()
+		return transferMsg{index: idx, err: err}
+	}
+}
+
+func (m transferModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		if msg.String() == "ctrl+c" {
+			m.quitting = true
+			return m, tea.Quit
+		}
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.spinner, cmd = m.spinner.Update(msg)
+		return m, cmd
+	case transferMsg:
+		if msg.err != nil {
+			m.err = msg.err
+			return m, tea.Quit
+		}
+		m.index++
+		if m.index >= len(m.paths) {
+			m.quitting = true
+			return m, tea.Quit
+		}
+		return m, m.runTransfer(m.index)
+	}
+	return m, nil
+}
+
+func (m transferModel) View() string {
+	if m.err != nil {
+		return statusStyle.Render(fmt.Sprintf("\nTransfer Error: %v\n", m.err))
+	}
+
+	if m.index >= len(m.paths) && m.quitting {
+		return doneStyle.Render("\n✔ All transfers complete!\n")
+	}
+
+	total := len(m.paths)
+	currentFile := filepath.Base(m.paths[m.index])
+	pct := float64(m.index) / float64(total)
+
+	header := "Uploading"
+	if m.isDownload {
+		header = "Downloading"
+	}
+
+	return fmt.Sprintf(
+		"\n %s %s %s %s\n\n %s\n %s %d/%d items\n\n",
+		m.spinner.View(),
+		statusStyle.Render(header),
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#FAFAFA")).Render(currentFile),
+		infoStyle.Render(fmt.Sprintf("(Item %d of %d)", m.index+1, total)),
+		m.progress.ViewAs(pct),
+		infoStyle.Render("Progress:"), m.index, total,
+	)
+}
+
+// ---------- DOWNLOAD LIST SELECTION ----------
 
 type downloadModel struct {
 	list     list.Model
 	selected map[string]bool
-	user     string
-	host     string
-	path     string
-	dest     string
-	status   string
+	quitting bool
 }
 
 type downloadDelegate struct {
-	m *downloadModel
+	model *downloadModel // Pointer to parent model to access 'selected' map
 }
 
 func (d downloadDelegate) Height() int                               { return 1 }
@@ -123,33 +226,30 @@ func (d downloadDelegate) Spacing() int                              { return 0 
 func (d downloadDelegate) Update(msg tea.Msg, m *list.Model) tea.Cmd { return nil }
 func (d downloadDelegate) Render(w io.Writer, m list.Model, index int, listItem list.Item) {
 	it := listItem.(item)
-	cursor := " "
+	cursor := "  "
 	if index == m.Index() {
-		cursor = ">"
+		cursor = "> "
 	}
-	prefix := " "
-	if d.m.selected[it.name] {
-		prefix = "x"
+	checked := "[ ]"
+	if d.model != nil && d.model.selected[it.name] {
+		checked = "[x]"
 	}
-	fmt.Fprintf(w, "%s [%s] %-25s (%d bytes)", cursor, prefix, it.name, it.size)
+	fmt.Fprintf(w, "%s %s %-25s (%d bytes)", cursor, checked, it.name, it.size)
 }
 
-func initialDownloadModel(items []list.Item, user, host, path, dest string) downloadModel {
-	m := downloadModel{
+// Helper to create the model and link the delegate correctly
+func newDownloadModel(items []list.Item) *downloadModel {
+	m := &downloadModel{
 		selected: make(map[string]bool),
-		user:     user,
-		host:     host,
-		path:     path,
-		dest:     dest,
-		status:   "ready",
 	}
-	m.list = list.New(items, downloadDelegate{m: &m}, 80, 20)
-	m.list.Title = "Remote files"
+	d := downloadDelegate{model: m}
+	m.list = list.New(items, d, 80, 20)
+	m.list.Title = "Select items to download"
 	return m
 }
 
-func (m downloadModel) Init() tea.Cmd { return nil }
-func (m downloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *downloadModel) Init() tea.Cmd { return nil }
+func (m *downloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -160,6 +260,7 @@ func (m downloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "c":
 			return m, tea.Quit
 		case "q", "ctrl+c":
+			m.quitting = true
 			return m, tea.Quit
 		}
 	}
@@ -168,211 +269,144 @@ func (m downloadModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func (m downloadModel) View() string {
-	return fmt.Sprintf("%s\n\nSelected: %d | Dest: %s\n[enter] toggle  [c] confirm copy  [q] cancel/quit",
-		m.list.View(), len(m.selected), m.dest)
+func (m *downloadModel) View() string {
+	return "\n" + m.list.View() + "\n [enter] toggle | [c] confirm | [q] cancel"
 }
 
-func (m downloadModel) copyCmd() {
-	for name, isSelected := range m.selected {
-		if !isSelected {
-			continue
-		}
-		remote := fmt.Sprintf("%s@%s:%s/%s", m.user, m.host, m.path, name)
-		cmd := exec.Command("scp", "-r", remote, m.dest)
-		fmt.Printf("Copying %s...\n", name)
-		cmd.Run()
-	}
-}
-
-// ---------- MAIN MENU TUI MODEL ----------
-
-type menuChoice string
-
-const (
-	choiceDownload menuChoice = "download"
-	choiceUpload   menuChoice = "upload"
-	choiceQuit     menuChoice = "quit"
-)
-
-type menuItem struct {
-	title, desc string
-	choice      menuChoice
-}
-
-func (i menuItem) Title() string       { return i.title }
-func (i menuItem) Description() string { return i.desc }
-func (i menuItem) FilterValue() string { return i.title }
-
-type menuModel struct {
-	list     list.Model
-	selected menuChoice
-}
-
-func initialMenuModel() menuModel {
-	items := []list.Item{
-		menuItem{title: "Download from remote", desc: "Select remote files to download to your PC", choice: choiceDownload},
-		menuItem{title: "Upload to remote", desc: "Select local files/folders to upload to the server", choice: choiceUpload},
-		menuItem{title: "Quit", desc: "Exit the application", choice: choiceQuit},
-	}
-	m := menuModel{
-		list:     list.New(items, list.NewDefaultDelegate(), 60, 15),
-		selected: choiceQuit, // Default safely to quit
-	}
-	m.list.Title = "File Transfer Menu"
-	m.list.SetShowStatusBar(false)
-	m.list.SetFilteringEnabled(false)
-	return m
-}
-
-func (m menuModel) Init() tea.Cmd { return nil }
-
-func (m menuModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
-			m.selected = choiceQuit
-			return m, tea.Quit
-		case "enter":
-			if i, ok := m.list.SelectedItem().(menuItem); ok {
-				m.selected = i.choice
-			}
-			return m, tea.Quit
+func (m *downloadModel) getSelectedPaths() []string {
+	var paths []string
+	for name, ok := range m.selected {
+		if ok {
+			paths = append(paths, name)
 		}
 	}
-
-	var cmd tea.Cmd
-	m.list, cmd = m.list.Update(msg)
-	return m, cmd
-}
-
-func (m menuModel) View() string {
-	return "\n" + m.list.View()
+	return paths
 }
 
 // ---------- LOGIC HANDLERS ----------
 
 func handleDownload(user, host, remotePath string) {
-	fmt.Println("\n[Download] Opening folder dialog to select save location...")
-	dest, err := openFolderDialog("Select Download Destination")
-	if err != nil || dest == "" {
+	dest, _ := openFolderDialog("Select Download Destination")
+	if dest == "" {
 		fmt.Println("Cancelled.")
 		return
 	}
 
 	items, err := listRemote(user, host, remotePath)
 	if err != nil {
-		fmt.Println("Error listing remote files:", err)
+		fmt.Println("Error connecting to server:", err)
 		return
 	}
 
-	p := tea.NewProgram(initialDownloadModel(items, user, host, remotePath, dest))
-	finalModel, _ := p.Run()
+	// Correctly initialize model with pointer linking
+	selModel := newDownloadModel(items)
+	p := tea.NewProgram(selModel)
+	finalSel, err := p.Run()
 
-	if m, ok := finalModel.(downloadModel); ok {
-		// Only run the copy command if there are actually files selected
-		hasSelections := false
-		for _, v := range m.selected {
-			if v {
-				hasSelections = true
-				break
-			}
-		}
-
-		if hasSelections {
-			m.copyCmd()
-			fmt.Println("Download complete!")
-		} else {
-			fmt.Println("No files selected for download.")
-		}
+	if err != nil || finalSel == nil {
+		return
 	}
+
+	m := finalSel.(*downloadModel)
+	if m.quitting {
+		return
+	}
+
+	selectedPaths := m.getSelectedPaths()
+	if len(selectedPaths) == 0 {
+		fmt.Println("No files selected.")
+		return
+	}
+
+	// Start the Transfer UI
+	t := transferModel{
+		user:       user,
+		host:       host,
+		remotePath: remotePath,
+		localDest:  dest,
+		paths:      selectedPaths,
+		isDownload: true,
+		spinner:    spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(statusStyle)),
+		progress:   progress.New(progress.WithDefaultGradient()),
+	}
+	tea.NewProgram(t).Run()
 }
 
 func handleUpload(user, host, remotePath string) {
-	fmt.Print("\nUpload [f]iles or a [d]irectory? (f/d): ")
-	var choice string
-	fmt.Scanln(&choice)
+	var uploadType string
+	huh.NewSelect[string]().
+		Title("Upload Mode").
+		Options(huh.NewOption("Files", "f"), huh.NewOption("Folder", "d")).
+		Value(&uploadType).
+		Run()
 
 	var paths []string
-	var err error
-	choice = strings.ToLower(strings.TrimSpace(choice))
-
-	if choice == "d" {
-		folderPath, errDialog := openFolderDialog("Select Folder to Upload")
-		err = errDialog
-		if folderPath != "" {
-			paths = append(paths, folderPath)
+	if uploadType == "d" {
+		p, _ := openFolderDialog("Select Folder")
+		if p != "" {
+			paths = append(paths, p)
 		}
 	} else {
-		paths, err = openFileDialog("Select Files to Upload")
+		paths, _ = openFileDialog("Select Files")
 	}
 
-	if err != nil || len(paths) == 0 {
-		fmt.Println("Cancelled.")
+	if len(paths) == 0 {
 		return
 	}
 
-	for _, localPath := range paths {
-		cleanPath := strings.TrimSpace(localPath)
-		if cleanPath == "" {
-			continue
-		}
-
-		fmt.Printf("Uploading: %s ... ", filepath.Base(cleanPath))
-		cmd := exec.Command("scp", "-r", cleanPath, fmt.Sprintf("%s@%s:%s", user, host, remotePath))
-		if err := cmd.Run(); err != nil {
-			fmt.Printf("FAILED: %v\n", err)
-		} else {
-			fmt.Println("SUCCESS")
-		}
+	t := transferModel{
+		user:       user,
+		host:       host,
+		remotePath: remotePath,
+		paths:      paths,
+		isDownload: false,
+		spinner:    spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(statusStyle)),
+		progress:   progress.New(progress.WithDefaultGradient()),
 	}
-	fmt.Println("\nAll uploads complete.")
-}
-
-// ---------- ERROR CHECKING FOR CONFIGURATION ----------
-func validateConfig(user, host, path string) error {
-	if user == "" || host == "" || path == "" {
-		return errors.New("missing required environment variables (user, host, or remotePath)")
-	}
-	return nil
+	tea.NewProgram(t).Run()
 }
 
 // ---------- MAIN ----------
 
 func main() {
-	user := ""       //PUT YOUR USERNAME HERE
-	host := ""       //PUT YOUR IP HERE
-	remotePath := "" //PUT YOUR REMOTE PATH HERE
-	if user == "" || host == "" || remotePath == "" {
-		// \033[31m is the ANSI code for Red, \033[0m resets it
-		fmt.Fprintf(os.Stderr, "\033[31mConfiguration Error: user, host, and remotePath must be set in main() before running.\033[0m\n")
-		os.Exit(1)
-	}
-	for {
-		// Run the main menu TUI
-		p := tea.NewProgram(initialMenuModel())
-		finalModel, err := p.Run()
-		if err != nil {
-			fmt.Printf("Alas, there's been an error: %v", err)
-			os.Exit(1)
-		}
+	var user string
+	host, remotePath := "192.168.1.147", "~/Downloads"
 
-		// Handle the user's choice from the menu
-		if m, ok := finalModel.(menuModel); ok {
-			switch m.selected {
-			case choiceDownload:
-				handleDownload(user, host, remotePath)
-			case choiceUpload:
-				handleUpload(user, host, remotePath)
-			case choiceQuit:
-				fmt.Println("Goodbye!")
-				return
+	huh.NewInput().
+		Title("Remote Login").
+		Prompt("Username: ").
+		Value(&user).
+		Validate(func(s string) error {
+			if strings.TrimSpace(s) == "" {
+				return errors.New("username is required")
 			}
+			return nil
+		}).
+		Run()
+
+	for {
+		var choice string
+		huh.NewSelect[string]().
+			Title("File Transfer Menu").
+			Options(
+				huh.NewOption("Download Files", "dl"),
+				huh.NewOption("Upload Files", "up"),
+				huh.NewOption("Quit", "q"),
+			).
+			Value(&choice).
+			Run()
+
+		switch choice {
+		case "dl":
+			handleDownload(user, host, remotePath)
+		case "up":
+			handleUpload(user, host, remotePath)
+		case "q":
+			fmt.Println("Goodbye!")
+			return
 		}
 
-		// Pause briefly to let the user read success/error messages before returning to the menu
-		fmt.Println("\nPress [Enter] to return to the main menu...")
+		fmt.Println("\nAction finished. Press Enter to return to menu...")
 		fmt.Scanln()
 	}
 }

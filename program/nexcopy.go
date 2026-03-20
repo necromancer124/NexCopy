@@ -370,7 +370,7 @@ func handleUpload(user, host, remotePath string) {
 
 func main() {
 	var user string
-	host, remotePath := "192.168.1.147", "~/Downloads"
+	host, remotePath := "", ""
 
 	huh.NewInput().
 		Title("Remote Login").
